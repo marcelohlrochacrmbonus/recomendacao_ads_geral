@@ -1,0 +1,8 @@
+azure-functions==1.21.3
+certifi==2024.8.30
+clickhouse-connect==0.8.9
+lz4==4.3.3
+python-dotenv==1.0.1
+pytz==2024.2
+urllib3==2.2.3
+zstandard==0.23.0
