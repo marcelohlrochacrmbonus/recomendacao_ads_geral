@@ -1,39 +1,44 @@
-import azure.functions as func
 import logging
-import clickhouse_connect
+import azure.functions as func
 import json
 import os
 import re
 from datetime import datetime
-from dotenv import load_dotenv
 
-# Carrega variáveis do .env
-load_dotenv()
-
-# Inicializa o cliente ClickHouse
-client = clickhouse_connect.get_client(
-    host=os.getenv('CLICKHOUSE_HOST'),
-    user=os.getenv('CLICKHOUSE_USER'),
-    password=os.getenv('CLICKHOUSE_PASSWORD'),
-    secure=True,
-    connect_timeout=5
-)
-
-# Inicializa a Azure Function
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
-
-@app.route(route="oferta")
-def oferta(req: func.HttpRequest) -> func.HttpResponse:
+def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Azure Function 'oferta' iniciada.")
 
-    # Obtém os parâmetros da requisição
+    try:
+        import clickhouse_connect
+
+        clickhouse_host = os.getenv('CLICKHOUSE_HOST')
+        clickhouse_user = os.getenv('CLICKHOUSE_USER')
+        clickhouse_password = os.getenv('CLICKHOUSE_PASSWORD')
+
+        logging.info(f"[DEBUG] CLICKHOUSE_HOST={clickhouse_host}")
+        logging.info(f"[DEBUG] CLICKHOUSE_USER={clickhouse_user}")
+
+        client = clickhouse_connect.get_client(
+            host=clickhouse_host,
+            user=clickhouse_user,
+            password=clickhouse_password,
+            secure=True,
+            connect_timeout=5
+        )
+    except Exception as e:
+        logging.error(f"[ClickHouse Init] Erro ao inicializar cliente: {e}")
+        return func.HttpResponse(
+            json.dumps({"error": "Erro ao inicializar o cliente do ClickHouse."}),
+            mimetype="application/json",
+            status_code=500
+        )
+
     campanha = req.params.get('campanha')
     celular = req.params.get('celular')
-    local_id = req.params.get('local_id')  # Corrigido para garantir que venha corretamente
+    local_id = req.params.get('local_id')
     genero = req.params.get('genero')
     nascimento = req.params.get('nascimento')
 
-    # Captura parâmetros do corpo da requisição, se não vierem na URL
     if not campanha or not celular or local_id is None:
         try:
             req_body = req.get_json()
@@ -45,11 +50,9 @@ def oferta(req: func.HttpRequest) -> func.HttpResponse:
         except ValueError:
             pass
 
-    # Limpa o número do celular (remove caracteres não numéricos)
     if celular:
         celular = re.sub(r'\D', '', celular)
 
-    # Se não houver campanha, celular ou local_id, retorna erro
     if not campanha or not celular or local_id is None:
         return func.HttpResponse(
             json.dumps({"error": "Parâmetros 'campanha', 'celular' e 'local_id' são obrigatórios."}),
@@ -57,7 +60,6 @@ def oferta(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400
         )
 
-    # Certifica que local_id é um número válido
     try:
         local_id = int(local_id)
     except ValueError:
@@ -68,32 +70,28 @@ def oferta(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        # Construção da query para ClickHouse
         consulta = f'''
             WITH 
-            r1 AS
-            (
+            r1 AS (
                 SELECT DISTINCT ordem+100 AS ordem, pangeia_offer_id AS oferta
-                FROM recomendacao_geral.cliente
+                FROM recomendacao_ads.geral_cliente
                 WHERE campaign_id = '{campanha}' 
                 AND celular = '{celular}'
                 AND local_id = {local_id}  
             ),
-            r2 AS
-            (
+            r2 AS (
                 SELECT DISTINCT ordem+200 AS ordem, pangeia_offer_id AS oferta
-                FROM recomendacao_geral.cliente_segmento
+                FROM recomendacao_ads.geral_cliente_segmento
                 WHERE campaign_id = '{campanha}'
                 AND celular = '{celular}'
-                AND local_id = {local_id}  
+                AND local_id = {local_id}
                 AND pangeia_offer_id NOT IN (SELECT oferta FROM r1)
             ),
-            r3 AS
-            (
+            r3 AS (
                 SELECT ordem+300 AS ordem, pangeia_offer_id AS oferta
-                FROM recomendacao_geral.perfil
+                FROM recomendacao_ads.geral_perfil
                 WHERE campaign_id = '{campanha}' 
-                AND local_id = {local_id}  
+                AND local_id = {local_id}
         '''
 
         if genero is None:
@@ -101,29 +99,29 @@ def oferta(req: func.HttpRequest) -> func.HttpResponse:
         else:
             consulta += f" AND genero = '{genero}'"
 
-        if nascimento is None:
-            consulta += " AND faixa_etaria IS NULL"
-        else:
-            nascimento = datetime.strptime(nascimento, "%Y-%m-%d")
-            dias = datetime.today() - nascimento
-            idade = round(dias.days / 365, 0)
+        # ✅ Aqui está o único trecho ajustado para tratar nascimento inválido
+        try:
+            if nascimento and nascimento != "0000-00-00":
+                nascimento_dt = datetime.strptime(nascimento, "%Y-%m-%d")
+                idade = round((datetime.today() - nascimento_dt).days / 365)
 
-            if idade <= 27:
-                nascimento = 'F1'
-            elif 28 <= idade <= 37:
-                nascimento = 'F2'
-            elif 38 <= idade <= 47:
-                nascimento = 'F3'
+                faixa = (
+                    'F1' if idade <= 27 else
+                    'F2' if idade <= 37 else
+                    'F3' if idade <= 47 else
+                    'F4'
+                )
+                consulta += f" AND faixa_etaria = '{faixa}'"
             else:
-                nascimento = 'F4'
-
-            consulta += f" AND faixa_etaria = '{nascimento}'"
+                consulta += " AND faixa_etaria IS NULL"
+        except Exception as e:
+            logging.warning(f"[NASCIMENTO] Ignorado por formato inválido: {nascimento} ({e})")
+            consulta += " AND faixa_etaria IS NULL"
 
         consulta += f'''
                 AND pangeia_offer_id NOT IN (SELECT oferta FROM r1 UNION ALL SELECT oferta FROM r2)
             ),
-            r AS 
-            (
+            r AS (
                 SELECT * FROM r1
                 UNION ALL
                 SELECT * FROM r2 
@@ -131,7 +129,7 @@ def oferta(req: func.HttpRequest) -> func.HttpResponse:
                 SELECT * FROM r3
                 UNION ALL
                 SELECT ordem, pangeia_offer_id 
-                FROM recomendacao_geral.ofertas_priorizacao
+                FROM recomendacao_ads.geral_ofertas_priorizacao
                 WHERE local_id = {local_id}  
                 AND pangeia_offer_id NOT IN (SELECT DISTINCT oferta FROM r1)
                 AND pangeia_offer_id NOT IN (SELECT DISTINCT oferta FROM r2)
@@ -143,14 +141,10 @@ def oferta(req: func.HttpRequest) -> func.HttpResponse:
 
         logging.info(f"Query construída:\n{consulta}")
 
-        # Executa a query no ClickHouse
         rows = client.query(consulta)
-
-        # Processa os resultados
         columns = rows.column_names
         data = [dict(zip(columns, row)) for row in rows.result_set]
 
-        # Converte para JSON e retorna
         return func.HttpResponse(
             body=json.dumps(data, separators=(',', ':')),
             mimetype="application/json",
